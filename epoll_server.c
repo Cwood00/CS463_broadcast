@@ -20,8 +20,9 @@ struct sendQueueNode
 struct fdInfo
 {
     int fd;
-    int writeIndex;
+    int readIndex;
     char readBuffer[BUFFER_SIZE];
+    int sendIndex;
     struct sendQueueNode *firstMessage;
     struct sendQueueNode *lastMessage;
 } socketsInfo[MAX_CLIENTS];
@@ -38,28 +39,44 @@ void set_socket_non_blocking(int socket_fd) {
     }
 }
 
-void addMessageToQueue(int sockectIndex, char* message)
+void addMessageToQueue(int socketIndex, char* message)
 {
-    if(socketsInfo[sockectIndex].firstMessage == NULL)
+    if(socketsInfo[socketIndex].firstMessage == NULL)
     {
-        socketsInfo[sockectIndex].firstMessage = malloc(sizeof(struct sendQueueNode));
-        socketsInfo[sockectIndex].lastMessage = socketsInfo[sockectIndex].firstMessage;
+        socketsInfo[socketIndex].firstMessage = malloc(sizeof(struct sendQueueNode));
+        socketsInfo[socketIndex].lastMessage = socketsInfo[socketIndex].firstMessage;
     }
     else
     {
-        socketsInfo[sockectIndex].lastMessage->nextMessage = malloc(sizeof(struct sendQueueNode));
-        socketsInfo[sockectIndex].lastMessage = socketsInfo[sockectIndex].lastMessage->nextMessage;
+        socketsInfo[socketIndex].lastMessage->nextMessage = malloc(sizeof(struct sendQueueNode));
+        socketsInfo[socketIndex].lastMessage = socketsInfo[socketIndex].lastMessage->nextMessage;
 
     }
 
-    socketsInfo[sockectIndex].lastMessage->message = message;
-    socketsInfo[sockectIndex].lastMessage->nextMessage = NULL;
+    socketsInfo[socketIndex].lastMessage->message = message;
+    socketsInfo[socketIndex].lastMessage->nextMessage = NULL;
 }
+
+void deletMessageFromQueue(int socketIndex)
+{
+    struct sendQueueNode *temp = socketsInfo[socketIndex].firstMessage;
+    socketsInfo[socketIndex].firstMessage = socketsInfo[socketIndex].firstMessage->nextMessage;
+
+    free(temp->message);
+    free(temp);
+
+    if(socketsInfo[socketIndex].firstMessage == NULL)
+    {
+        socketsInfo[socketIndex].lastMessage = NULL;
+    }
+}
+
+void handle_write_event(int socketIndex);
 
 int handle_read_event(int socketIndex)
 {
     int socketFD = socketsInfo[socketIndex].fd;
-    int writeIndex = socketsInfo[socketIndex].writeIndex;
+    int readIndex = socketsInfo[socketIndex].readIndex;
     while(1)
     {
         char charRead;
@@ -71,7 +88,7 @@ int handle_read_event(int socketIndex)
             {
                 printf("Error reading on socket %d", socketFD);
             }
-            socketsInfo[socketIndex].writeIndex = writeIndex;
+            socketsInfo[socketIndex].readIndex = readIndex;
             return 0;
         }
         if(readReturn == 0)
@@ -80,9 +97,9 @@ int handle_read_event(int socketIndex)
             return 1;
         }
 
-        if(writeIndex < BUFFER_SIZE -1)
+        if(readIndex < BUFFER_SIZE -1)
         {
-            socketsInfo[socketIndex].readBuffer[writeIndex] = charRead;
+            socketsInfo[socketIndex].readBuffer[readIndex] = charRead;
         }
         else
         {
@@ -91,27 +108,55 @@ int handle_read_event(int socketIndex)
         }
         if(charRead == '\n')
         {
-            socketsInfo[socketIndex].readBuffer[writeIndex + 1] = '\0';
+            socketsInfo[socketIndex].readBuffer[readIndex + 1] = '\0';
             for(int i = 0; i < MAX_CLIENTS; i++)
             {
                 if(socketsInfo[i].fd != -1 && socketsInfo[i].fd != socketFD)
                 {
                     addMessageToQueue(i, strdup(socketsInfo[socketIndex].readBuffer));
+                    handle_write_event(i);
                 }
             }
-            writeIndex = 0;
+            readIndex = 0;
         }
         else
         {
-            writeIndex += 1;
+            readIndex += 1;
         }
     }
-    return 0;
 }
 
-int handle_write_event(int socketIndex)
+void handle_write_event(int socketIndex)
 {
-    return 0;
+    int socketFD = socketsInfo[socketIndex].fd;
+    int sendIndex = socketsInfo[socketIndex].sendIndex;
+    while(1)
+    {
+        int messageSize = strlen(socketsInfo[socketIndex].firstMessage->message) - sendIndex;
+        int bytesSent = send(socketFD, socketsInfo[socketIndex].firstMessage->message + sendIndex, messageSize, 0);
+
+        if(bytesSent == messageSize)
+        {
+            deletMessageFromQueue(socketIndex);
+            sendIndex = 0;
+            if (socketsInfo[socketIndex].firstMessage == NULL)
+            {
+                break;
+            }
+        }
+        else
+        {
+            if(bytesSent == -1)
+            {
+                if(errno != EAGAIN)
+                {
+                    printf("Error sending on socket %d", socketFD);
+                }
+            }
+            socketsInfo[socketIndex].sendIndex = sendIndex;
+            break;
+        }
+    }
 }
 
 int main (int argc, char* argv[])
@@ -191,10 +236,10 @@ int main (int argc, char* argv[])
         perror("epoll");
     }
 
+    memset(socketsInfo, 0, sizeof(socketsInfo));
     for (int i = 0; i < MAX_CLIENTS; i++)
     {
         socketsInfo[i].fd = -1;
-        socketsInfo[i].writeIndex = 0;
     }
 
     while(1)
@@ -221,32 +266,35 @@ int main (int argc, char* argv[])
 
                 for (int j = 0; j < MAX_CLIENTS; j++)
                 {
-                    if(events[j].data.fd == -1)
+                    if(socketsInfo[j].fd == -1)
                     {
-                        events[j].data.fd = new_socket;
+                        socketsInfo[j].fd = new_socket;
                         break;
                     }
                 }
             }
-            
-            int socketIndex = -1;
-            for (int j = 0; j < MAX_CLIENTS; j++)
+
+            else
             {
-                if(events[i].data.fd == socketsInfo[j].fd)
+                int socketIndex = -1;
+                for (int j = 0; j < MAX_CLIENTS; j++)
                 {
-                    socketIndex = j;
-                    break;
+                    if(events[i].data.fd == socketsInfo[j].fd)
+                    {
+                        socketIndex = j;
+                        break;
+                    }
                 }
-            }
-            //Read event
-            if(events[i].events & EPOLLIN)
-            {
-                handle_read_event(socketIndex);
-            }
-            //Write event
-            if(events[i].events & EPOLLOUT)
-            {
-                handle_write_event(socketIndex);
+                //Read event
+                if(events[i].events & EPOLLIN)
+                {
+                    handle_read_event(socketIndex);
+                }
+                //Write event
+                if((events[i].events & EPOLLOUT) && socketsInfo[socketIndex].firstMessage != NULL)
+                {
+                    handle_write_event(socketIndex);
+                }
             }
 
         }
